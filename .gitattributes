@@ -1,0 +1,8 @@
+# Normalize line endings: shell scripts MUST be LF, even on Windows checkouts.
+# Without this, core.autocrlf=true can leave .sh files with CRLF in the working
+# tree, which shellcheck flags as SC1017 and bash on Linux may misparse.
+*.sh text eol=lf
+
+# Scripts executed by the installer (sourced/downloaded) also stay LF.
+install.sh text eol=lf
+deploy.sh text eol=lf

@@ -1,0 +1,12 @@
+# Allowlist for repo-test-parity script.
+# One test name per line (without pg_ prefix).
+# Lines starting with # are comments and ignored.
+#
+# Format: <test_name>  # <reason>
+
+# SQLite-only migration helpers — PG initialises via pg_schema.rs, no in-schema migrations.
+migration_creates_app_settings_table  # SQLite-only: Migration 25 idempotency test
+migration_adds_password_columns  # SQLite-only: Migration 26 idempotency test
+
+# PG-only schema-seed guard — SQLite bootstraps via SCHEMA_SQL without a seed-version table.
+apply_schema_seeds_baseline_version  # PG-only: schema_version seed baseline check

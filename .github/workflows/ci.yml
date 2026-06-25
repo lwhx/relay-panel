@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: fmt + clippy + test + lint + build + e2e
+    runs-on: ubuntu-latest
+
+    # v0.4.3 PR2: PostgreSQL service for the PgRepository contract tests.
+    # The tests gate on TEST_PG_URL — when present, the pg_repo::tests module
+    # runs against this service; when absent (local dev) it skips. health check
+    # waits for PG to accept connections before cargo test starts.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: relaytest
+          POSTGRES_PASSWORD: relaytest
+          POSTGRES_DB: relaytest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relaytest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_PG_URL: postgres://relaytest:relaytest@localhost:5432/relaytest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Install Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: repo test parity
+        run: bash scripts/check-repo-test-parity.sh
+
+      - name: cargo build (debug, for e2e)
+        run: cargo build
+
+      - name: npm ci (frontend)
+        run: npm ci --no-audit --no-fund
+        working-directory: frontend
+
+      - name: Clear TypeScript cache
+        run: rm -f tsconfig.tsbuildinfo .tsbuildinfo
+        working-directory: frontend
+
+      - name: npm run typecheck (frontend)
+        run: npm run typecheck
+        working-directory: frontend
+
+      - name: npm run lint (frontend)
+        run: npm run lint
+        working-directory: frontend
+
+      - name: npm run test (frontend)
+        run: npm run test
+        working-directory: frontend
+
+      - name: npm run build (frontend)
+        run: npm run build
+        working-directory: frontend
+
+      - name: e2e test
+        run: python3 tests/e2e_test.py

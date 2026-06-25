@@ -1,0 +1,2405 @@
+// ── Contract tests ──
+//
+// These tests exercise the SqliteRepository trait impls DIRECTLY (not via the
+// HTTP handlers). They pin the contract each Repository method must satisfy so
+// PR2's PgRepository can re-run the same assertions against its own impl.
+//
+// What they DON'T cover: handler wiring (covered by api::admin / api::node
+// tests), SQL dialect specifics (the SQL strings themselves), or the
+// transactional batch edge cases (already covered by api::node::tests).
+
+use super::SqliteRepository;
+use crate::db::error::DbError;
+use crate::db::repo::*;
+use crate::db::schema::SCHEMA_SQL;
+use relay_shared::protocol::TrafficEntry;
+use sqlx::sqlite::SqlitePoolOptions;
+
+/// Build a fresh in-memory DB wrapped in a SqliteRepository. The schema is
+/// created via SCHEMA_SQL so every table + seed row (admin user, plans,
+/// builtin tunnel profiles) is present.
+async fn repo() -> SqliteRepository {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+    SqliteRepository::new(pool)
+}
+
+/// Seed an inbound device_group with the given id (rules reference
+/// device_group_in via FK, so the group must exist before any rule).
+async fn seed_group(db: &SqliteRepository, gid: i64) {
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (?, 'gin', 'in', ?, 1)",
+    )
+    .bind(gid)
+    .bind(format!("tok-{gid}"))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+/// Insert a user row with the given id + admin flag (FK target for groups).
+async fn seed_user(db: &SqliteRepository, id: i64, admin: bool) {
+    sqlx::query("INSERT INTO users (id, username, password, admin) VALUES (?, ?, 'x', ?)")
+        .bind(id)
+        .bind(format!("u{id}"))
+        .bind(admin as i64)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+}
+
+/// Insert a device group owned by `uid` with an explicit group_type.
+async fn seed_group_typed(db: &SqliteRepository, gid: i64, uid: i64, gtype: &str) {
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, connect_host, uid) \
+         VALUES (?, ?, ?, ?, '1.2.3.4', ?)",
+    )
+    .bind(gid)
+    .bind(format!("g{gid}"))
+    .bind(gtype)
+    .bind(format!("tok-{gid}"))
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+/// v0.4.12 PR1 (scenario 1): an admin-owned `group_type='in'` group is
+/// visible to a regular user even with NO rules. (scenario 8): the summary
+/// DTO carries no token/uid/config columns.
+#[tokio::test]
+async fn shared_groups_lists_admin_inbound_for_user_without_rules() {
+    let db = repo().await; // uid=1 admin is seeded
+    seed_user(&db, 2, false).await; // alice (regular)
+    seed_group_typed(&db, 10, 1, "in").await; // admin-owned inbound
+
+    let shared = db.list_shared_groups(2, false).await.unwrap();
+    assert_eq!(shared.len(), 1, "alice sees the admin inbound group");
+    assert_eq!(shared[0].id, 10);
+    // DTO is a SharedGroupSummary — it structurally cannot carry token/uid/
+    // config/fallback_group (compile-time guarantee), so a positive id match
+    // is sufficient here.
+}
+
+/// scenario 2: out / monitor groups never appear in the shared list.
+#[tokio::test]
+async fn shared_groups_excludes_non_inbound_types() {
+    let db = repo().await;
+    seed_user(&db, 2, false).await;
+    seed_group_typed(&db, 10, 1, "in").await;
+    seed_group_typed(&db, 11, 1, "out").await;
+    seed_group_typed(&db, 12, 1, "monitor").await;
+
+    let shared = db.list_shared_groups(2, false).await.unwrap();
+    assert_eq!(shared.len(), 1);
+    assert_eq!(shared[0].id, 10, "only the 'in' group is shared");
+}
+
+/// scenario 3: a regular user never sees ANOTHER regular user's group, even
+/// if it's an inbound group. Only admin-owned groups are shared.
+#[tokio::test]
+async fn shared_groups_excludes_other_regular_users_groups() {
+    let db = repo().await;
+    seed_user(&db, 2, false).await; // alice
+    seed_user(&db, 3, false).await; // bob (regular)
+    seed_group_typed(&db, 20, 3, "in").await; // bob's inbound group
+
+    let shared = db.list_shared_groups(2, false).await.unwrap();
+    assert!(
+        shared.is_empty(),
+        "alice must NOT see bob's (regular user) inbound group"
+    );
+}
+
+/// An admin caller gets an empty shared list (admins manage groups directly).
+#[tokio::test]
+async fn shared_groups_empty_for_admin() {
+    let db = repo().await;
+    seed_group_typed(&db, 10, 1, "in").await;
+    let shared = db.list_shared_groups(1, true).await.unwrap();
+    assert!(shared.is_empty());
+}
+
+#[tokio::test]
+async fn rule_targets_replace_and_list_enabled_in_order() {
+    let db = repo().await;
+    seed_group(&db, 1).await;
+    db.insert_quota_guarded(
+        "multi",
+        1,
+        21000,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        1,
+        None,
+        "direct",
+        "127.0.0.1",
+        80,
+    )
+    .await
+    .unwrap();
+    let rule = db.list_rules(&ResourceScope::All).await.unwrap().remove(0);
+
+    db.replace_rule_targets(
+        rule.id,
+        &ResourceScope::All,
+        &[
+            relay_shared::protocol::RuleTargetRequest {
+                host: "a.example.com".into(),
+                port: 1001,
+                enabled: true,
+            },
+            relay_shared::protocol::RuleTargetRequest {
+                host: "b.example.com".into(),
+                port: 1002,
+                enabled: false,
+            },
+            relay_shared::protocol::RuleTargetRequest {
+                host: "c.example.com".into(),
+                port: 1003,
+                enabled: true,
+            },
+        ],
+    )
+    .await
+    .unwrap();
+
+    let all = db
+        .list_rule_targets(rule.id, &ResourceScope::All)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].host, "a.example.com");
+    assert_eq!(all[1].position, 2);
+    assert!(!all[1].enabled);
+
+    let enabled = db
+        .list_enabled_rule_targets(rule.id, &ResourceScope::All)
+        .await
+        .unwrap();
+    assert_eq!(enabled.len(), 2);
+    assert_eq!(enabled[0].host, "a.example.com");
+    assert_eq!(enabled[1].host, "c.example.com");
+}
+
+// ── UserRepository ──
+
+#[tokio::test]
+async fn user_find_by_username_distinguishes_banned() {
+    let db = repo().await;
+    // Seed a non-admin, non-banned user via the public API.
+    db.insert_user("alice", "$2b$12$hash", 1).await.unwrap();
+
+    // find_by_username finds her regardless of banned flag.
+    assert!(db.find_by_username("alice").await.unwrap().is_some());
+
+    // Ban her; find_by_username_not_banned should now skip her.
+    sqlx::query("UPDATE users SET banned = 1 WHERE username = 'alice'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(db
+        .find_by_username_not_banned("alice")
+        .await
+        .unwrap()
+        .is_none());
+    // ...but find_by_username still returns the row.
+    assert!(db.find_by_username("alice").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn user_insert_returns_unique_violation_on_duplicate() {
+    let db = repo().await;
+    db.insert_user("alice", "h1", 1).await.unwrap();
+    // A second insert with the same username must surface as
+    // DbError::UniqueViolation, not a raw sqlx::Error or a silent success.
+    // This is the contract the register handler relies on to map to 409.
+    match db.insert_user("alice", "h2", 1).await {
+        Err(DbError::UniqueViolation) => {}
+        other => panic!("expected UniqueViolation, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn user_update_password_and_find_password_by_id_round_trip() {
+    let db = repo().await;
+    db.insert_user("alice", "old-hash", 1).await.unwrap();
+    let uid = db.find_by_username("alice").await.unwrap().unwrap().id;
+
+    // Initially the stored hash is what we inserted.
+    assert_eq!(
+        db.find_password_by_id(uid).await.unwrap().as_deref(),
+        Some("old-hash")
+    );
+    // Update and re-read.
+    assert_eq!(db.update_password(uid, "new-hash").await.unwrap(), 1);
+    assert_eq!(
+        db.find_password_by_id(uid).await.unwrap().as_deref(),
+        Some("new-hash")
+    );
+    // Update on a non-existent id affects 0 rows.
+    assert_eq!(db.update_password(999_999, "x").await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn user_update_fields_only_touches_present_columns() {
+    let db = repo().await;
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let uid = db.find_by_username("alice").await.unwrap().unwrap().id;
+
+    // Update only max_rules; other fields must stay at their seeded values.
+    assert_eq!(
+        db.update_user_fields(uid, None, Some(7), None, None)
+            .await
+            .unwrap(),
+        1
+    );
+    let row: (i32, i64, bool) =
+        sqlx::query_as("SELECT max_rules, traffic_limit, banned FROM users WHERE id = ?")
+            .bind(uid)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, 7);
+    assert_eq!(row.1, 0, "traffic_limit must be untouched");
+    assert!(!row.2, "banned must be untouched");
+
+    // With no fields present, returns 0 and writes nothing.
+    assert_eq!(
+        db.update_user_fields(uid, None, None, None, None)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn user_is_admin_and_exists_by_id_distinguish_known_rows() {
+    let db = repo().await;
+    // SCHEMA_SQL seeds user id=1 as admin. Find him.
+    assert!(db.exists_by_id(1).await.unwrap());
+    assert!(db.is_admin(1).await.unwrap());
+
+    // A non-existent id: exists=false, is_admin=false.
+    assert!(!db.exists_by_id(999_999).await.unwrap());
+    assert!(!db.is_admin(999_999).await.unwrap());
+
+    // Insert a non-admin and confirm is_admin returns false but exists true.
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let uid = db.find_by_username("alice").await.unwrap().unwrap().id;
+    assert!(db.exists_by_id(uid).await.unwrap());
+    assert!(!db.is_admin(uid).await.unwrap());
+}
+
+#[tokio::test]
+async fn user_reset_traffic_zeros_user_and_owned_rules_atomically() {
+    let db = repo().await;
+    seed_group(&db, 1).await;
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let uid = db.find_by_username("alice").await.unwrap().unwrap().id;
+    // Pre-charge traffic on the user and one rule.
+    sqlx::query("UPDATE users SET traffic_used = 500 WHERE id = ?")
+        .bind(uid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (name, uid, listen_port, device_group_in, target_addr, target_port, traffic_used) \
+         VALUES ('r1', ?, 20000, 1, '127.0.0.1', 80, 250)",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    db.reset_traffic(uid).await.unwrap();
+
+    let user_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = ?")
+        .bind(uid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let rule_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE uid = ?")
+        .bind(uid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(user_t.0, 0);
+    assert_eq!(rule_t.0, 0);
+}
+
+#[tokio::test]
+async fn user_delete_non_admin_protects_admins() {
+    let db = repo().await;
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+
+    // Alice (non-admin) is deletable.
+    assert_eq!(db.delete_non_admin(alice).await.unwrap(), 1);
+    assert!(!db.exists_by_id(alice).await.unwrap());
+
+    // User id=1 is admin — delete_non_admin must refuse (0 rows affected).
+    assert_eq!(db.delete_non_admin(1).await.unwrap(), 0);
+    assert!(db.exists_by_id(1).await.unwrap(), "admin must still exist");
+}
+
+#[tokio::test]
+async fn user_delete_cascade_clears_rules_groups_profiles_and_user() {
+    let db = repo().await;
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let uid = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query(
+        "INSERT INTO device_groups (name, group_type, token, uid) \
+         VALUES ('g1', 'in', 'tok-1', ?)",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES ('r1', ?, 20000, 1, '127.0.0.1', 80)",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // A custom (non-builtin) tunnel profile owned by alice. This is the row
+    // the pre-v0.4.4 cascade missed — it would FK-block the user delete AFTER
+    // rules+groups were already gone, leaving a half-deleted account.
+    sqlx::query(
+        "INSERT INTO tunnel_profiles (name, transport, uid) \
+         VALUES ('alice-custom', 'ws', ?)",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let affected = db.delete_user_cascade(uid).await.unwrap();
+    assert_eq!(affected, 1, "the user row must be deleted");
+
+    let rules: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM forward_rules WHERE uid = ?")
+        .bind(uid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let groups: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM device_groups WHERE uid = ?")
+        .bind(uid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let profiles: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tunnel_profiles WHERE uid = ?")
+        .bind(uid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let user: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ?")
+        .bind(uid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rules.0, 0);
+    assert_eq!(groups.0, 0);
+    assert_eq!(profiles.0, 0, "custom tunnel profile must be deleted too");
+    assert_eq!(user.0, 0, "user row must be gone");
+}
+
+#[tokio::test]
+async fn user_delete_cascade_refuses_admin_and_rolls_back() {
+    // Admin (id=1, seeded) with owned resources. The cascade must delete
+    // NOTHING and return 0 — the admin guard + rollback protect the account.
+    let db = repo().await;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (1, 'admin-g', 'in', 'tok-admin', 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES (1, 'admin-r', 1, 21000, 1, '127.0.0.1', 80)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let affected = db.delete_user_cascade(1).await.unwrap();
+    assert_eq!(affected, 0, "admin delete must affect 0 rows");
+
+    let groups: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM device_groups WHERE uid = 1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let rules: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM forward_rules WHERE uid = 1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        groups.0, 1,
+        "admin group must be rolled back (still present)"
+    );
+    assert_eq!(rules.0, 1, "admin rule must be rolled back (still present)");
+    assert!(db.exists_by_id(1).await.unwrap(), "admin must still exist");
+}
+
+#[tokio::test]
+async fn user_placeholder_password_methods_round_trip() {
+    let db = repo().await;
+    // SCHEMA_SQL seeds user id=1 with the placeholder password, so the
+    // count should start at 1.
+    assert_eq!(db.count_placeholder_admin_password().await.unwrap(), 1);
+
+    // Replace it with a real hash; count must drop to 0 and the row updates.
+    db.replace_placeholder_admin_password("$2b$12$realhash")
+        .await
+        .unwrap();
+    assert_eq!(db.count_placeholder_admin_password().await.unwrap(), 0);
+
+    // A second replace is a no-op (the WHERE no longer matches).
+    db.replace_placeholder_admin_password("$2b$12$other")
+        .await
+        .unwrap();
+    let stored: (String,) = sqlx::query_as("SELECT password FROM users WHERE id = 1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.0, "$2b$12$realhash",
+        "second replace must not overwrite"
+    );
+}
+
+// ── RuleRepository ──
+
+#[tokio::test]
+async fn rule_insert_quota_guarded_respects_max_rules() {
+    let db = repo().await;
+    seed_group(&db, 1).await;
+    // Use the seeded admin user (id=1). Cap his max_rules at 2.
+    sqlx::query("UPDATE users SET max_rules = 2 WHERE id = 1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Two inserts succeed.
+    assert_eq!(
+        db.insert_quota_guarded(
+            "r1",
+            1,
+            20000,
+            "tcp",
+            "raw",
+            "raw",
+            "direct",
+            "raw",
+            None,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.insert_quota_guarded(
+            "r2",
+            1,
+            20001,
+            "tcp",
+            "raw",
+            "raw",
+            "direct",
+            "raw",
+            None,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    // Third insert hits the quota: WHERE rejects → 0 rows affected.
+    assert_eq!(
+        db.insert_quota_guarded(
+            "r3",
+            1,
+            20002,
+            "tcp",
+            "raw",
+            "raw",
+            "direct",
+            "raw",
+            None,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+        )
+        .await
+        .unwrap(),
+        0,
+        "quota guard must reject the third insert"
+    );
+
+    // max_rules = 0 means unlimited.
+    sqlx::query("UPDATE users SET max_rules = 0 WHERE id = 1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.insert_quota_guarded(
+            "r4",
+            1,
+            20003,
+            "tcp",
+            "raw",
+            "raw",
+            "direct",
+            "raw",
+            None,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn rule_insert_quota_guarded_surfaces_port_unique_violation() {
+    let db = repo().await;
+    seed_group(&db, 1).await;
+    // First insert on port 20000 succeeds.
+    db.insert_quota_guarded(
+        "r1",
+        1,
+        20000,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        1,
+        None,
+        "direct",
+        "127.0.0.1",
+        80,
+    )
+    .await
+    .unwrap();
+    // Second insert on the SAME group + SAME port + overlapping socket type
+    // hits the in-transaction port pre-check → DbError::PortConflict (NOT a
+    // silent 0, NOT UniqueViolation). The handler relies on this to map to
+    // a 409. (The partial unique index is the backstop if a concurrent
+    // insert slips past the pre-check.)
+    match db
+        .insert_quota_guarded(
+            "r2",
+            1,
+            20000,
+            "tcp",
+            "raw",
+            "raw",
+            "direct",
+            "raw",
+            None,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+        )
+        .await
+    {
+        Err(DbError::PortConflict) => {}
+        other => panic!("expected PortConflict on port collision, got {:?}", other),
+    }
+}
+
+/// v0.4.11 PR4: a pure-TCP and a pure-UDP rule may share the same port on
+/// the same group; two TCP-bearing (or two UDP-bearing) rules may not.
+#[tokio::test]
+async fn rule_insert_quota_guarded_tcp_udp_share_port() {
+    let db = repo().await;
+    seed_group(&db, 1).await;
+    let insert = |name: &'static str, proto: &'static str| {
+        let db = &db;
+        async move {
+            db.insert_quota_guarded(
+                name,
+                1,
+                20000,
+                proto,
+                "raw",
+                "raw",
+                "direct",
+                "raw",
+                None,
+                1,
+                None,
+                "direct",
+                "127.0.0.1",
+                80,
+            )
+            .await
+        }
+    };
+    // tcp on 20000 → OK.
+    insert("r1", "tcp").await.unwrap();
+    // udp on the SAME port + group → OK (different socket type).
+    insert("r2", "udp").await.unwrap();
+    // Another tcp on 20000 → PortConflict (TCP already held).
+    match insert("r3", "tcp").await {
+        Err(DbError::PortConflict) => {}
+        other => panic!("expected PortConflict for second tcp, got {:?}", other),
+    }
+    // Another udp on 20000 → PortConflict (UDP already held).
+    match insert("r4", "udp").await {
+        Err(DbError::PortConflict) => {}
+        other => panic!("expected PortConflict for second udp, got {:?}", other),
+    }
+    // tcp_udp on 20000 → PortConflict (overlaps both).
+    match insert("r5", "tcp_udp").await {
+        Err(DbError::PortConflict) => {}
+        other => panic!("expected PortConflict for tcp_udp, got {:?}", other),
+    }
+}
+
+/// v0.4.11 PR4: the same port on a DIFFERENT group is allowed (independent
+/// pools). Different users sharing one group share its pool — modeled here
+/// by inserting two rules with different uids into the same group.
+#[tokio::test]
+async fn rule_insert_quota_guarded_port_scoped_by_group() {
+    let db = repo().await;
+    seed_group(&db, 1).await;
+    seed_group(&db, 2).await;
+    let insert = |name: &'static str, uid: i64, group: i64| {
+        let db = &db;
+        async move {
+            db.insert_quota_guarded(
+                name,
+                uid,
+                20000,
+                "tcp",
+                "raw",
+                "raw",
+                "direct",
+                "raw",
+                None,
+                group,
+                None,
+                "direct",
+                "127.0.0.1",
+                80,
+            )
+            .await
+        }
+    };
+    // group 1, port 20000 → OK.
+    insert("r1", 1, 1).await.unwrap();
+    // group 2, same port → OK (different group).
+    insert("r2", 1, 2).await.unwrap();
+    // group 1 again from a DIFFERENT user → shared pool → PortConflict.
+    match insert("r3", 2, 1).await {
+        Err(DbError::PortConflict) => {}
+        other => panic!(
+            "expected PortConflict on shared group pool, got {:?}",
+            other
+        ),
+    }
+}
+
+#[tokio::test]
+async fn rule_update_rule_fields_partial_update() {
+    let db = repo().await;
+    seed_group(&db, 1).await;
+    db.insert_quota_guarded(
+        "r1",
+        1,
+        20000,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        1,
+        None,
+        "direct",
+        "127.0.0.1",
+        80,
+    )
+    .await
+    .unwrap();
+    let rule_id = db
+        .list_rules(&ResourceScope::All)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .id;
+
+    // Rename only; protocol must be untouched.
+    assert_eq!(
+        db.update_rule_fields(
+            rule_id,
+            &ResourceScope::All,
+            Some("renamed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let row: (String, String) =
+        sqlx::query_as("SELECT name, protocol FROM forward_rules WHERE id = ?")
+            .bind(rule_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, "renamed");
+    assert_eq!(row.1, "tcp", "protocol must be untouched");
+
+    // Switching to direct clears device_group_out via Some(None) (the
+    // outer-Some / inner-None shape), not a separate force flag.
+    assert_eq!(
+        db.update_rule_fields(
+            rule_id,
+            &ResourceScope::All,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(None),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let dgo: (Option<i64>,) =
+        sqlx::query_as("SELECT device_group_out FROM forward_rules WHERE id = ?")
+            .bind(rule_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(dgo.0.is_none(), "device_group_out must be cleared");
+}
+
+#[tokio::test]
+async fn rule_list_active_for_config_filters_banned_paused_overquota() {
+    let db = repo().await;
+    // Seed a second user (non-admin) with a group + rule.
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (50, 'gin', 'in', 'tok-50', ?)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES ('r-active', ?, 20000, 50, '127.0.0.1', 80)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // Initially the rule appears in the active set for group 50.
+    assert_eq!(db.list_active_for_config(50).await.unwrap().len(), 1);
+
+    // Pause it → filtered out.
+    sqlx::query("UPDATE forward_rules SET paused = 1 WHERE device_group_in = 50")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_active_for_config(50).await.unwrap().len(),
+        0,
+        "paused rule must be filtered"
+    );
+    sqlx::query("UPDATE forward_rules SET paused = 0 WHERE device_group_in = 50")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Ban alice → filtered out.
+    sqlx::query("UPDATE users SET banned = 1 WHERE id = ?")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_active_for_config(50).await.unwrap().len(),
+        0,
+        "banned user's rule must be filtered"
+    );
+    sqlx::query("UPDATE users SET banned = 0 WHERE id = ?")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Over-quota → filtered (traffic_limit=100, traffic_used=100).
+    sqlx::query("UPDATE users SET traffic_limit = 100, traffic_used = 100 WHERE id = ?")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_active_for_config(50).await.unwrap().len(),
+        0,
+        "over-quota user's rule must be filtered"
+    );
+
+    // traffic_limit = 0 means unlimited — must reappear even with high usage.
+    sqlx::query("UPDATE users SET traffic_limit = 0 WHERE id = ?")
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.list_active_for_config(50).await.unwrap().len(),
+        1,
+        "unlimited-quota rule must reappear"
+    );
+}
+
+// ── GroupRepository ──
+
+#[tokio::test]
+async fn group_insert_then_find_by_token_round_trip() {
+    let db = repo().await;
+    db.insert_group("gin", "in", "tok-abc", 1, "1.2.3.4", "20000-30000")
+        .await
+        .unwrap();
+    let g = db.find_by_token("tok-abc").await.unwrap().unwrap();
+    assert_eq!(g.name, "gin");
+    assert_eq!(g.group_type, "in");
+    assert_eq!(g.connect_host, "1.2.3.4");
+
+    // find_by_token_after_insert returns the same row.
+    let g2 = db
+        .find_by_token_after_insert("tok-abc")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(g2.id, g.id);
+
+    // Unknown token → None.
+    assert!(db.find_by_token("nope").await.unwrap().is_none());
+
+    // find_name_by_id returns the name.
+    assert_eq!(
+        db.find_name_by_id(g.id, &ResourceScope::All)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("gin")
+    );
+}
+
+#[tokio::test]
+async fn group_update_token_returns_rows_affected() {
+    let db = repo().await;
+    db.insert_group("gin", "in", "tok-1", 1, "", "")
+        .await
+        .unwrap();
+    let g = db.find_by_token("tok-1").await.unwrap().unwrap();
+
+    // Existing id → 1 row affected, and the new token now resolves.
+    assert_eq!(
+        db.update_group_token(g.id, &ResourceScope::All, "tok-2")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(db.find_by_token("tok-1").await.unwrap().is_none());
+    assert!(db.find_by_token("tok-2").await.unwrap().is_some());
+
+    // Unknown id → 0 rows.
+    assert_eq!(
+        db.update_group_token(999_999, &ResourceScope::All, "tok-3")
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+// ── TrafficRepository ──
+
+#[tokio::test]
+async fn traffic_batch_applies_to_rule_and_user() {
+    let db = repo().await;
+    // Seed alice + group 50 + rule 100 owned by alice on group 50.
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (50, 'gin', 'in', 'tok-50', ?)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES (100, 'r100', ?, 20000, 50, '127.0.0.1', 80)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let results = db
+        .apply_traffic_batch(
+            50,
+            &[relay_shared::protocol::TrafficEntry {
+                rule_id: 100,
+                upload: 1000,
+                download: 2000,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+
+    let rule_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let user_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = ?")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_t.0, 3000);
+    assert_eq!(user_t.0, 3000);
+}
+
+#[tokio::test]
+async fn traffic_batch_other_group_rule_yields_othergrouprule_and_rolls_back() {
+    let db = repo().await;
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    // group 50 (alice's), group 60 (also alice's — same user, different
+    // group, so the rule legitimately exists but is owned by group 60).
+    for gid in [50, 60] {
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) \
+             VALUES (?, 'g', 'in', ?, ?)",
+        )
+        .bind(gid)
+        .bind(format!("tok-{gid}"))
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    // rule 100 on group 50 (legitimate for token tok-50).
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES (100, 'r100', ?, 20000, 50, '127.0.0.1', 80)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // rule 200 on group 60 — NOT owned by group 50.
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES (200, 'r200', ?, 20001, 60, '127.0.0.1', 80)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // Batch contains BOTH rule 100 (legitimate) and rule 200 (foreign).
+    // The contract: a foreign rule → Unavailable, entire batch rolled back.
+    let results = db
+        .apply_traffic_batch(
+            50,
+            &[
+                relay_shared::protocol::TrafficEntry {
+                    rule_id: 100,
+                    upload: 500,
+                    download: 0,
+                },
+                relay_shared::protocol::TrafficEntry {
+                    rule_id: 200,
+                    upload: 0,
+                    download: 999,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    // v0.4.9: a foreign rule yields Unavailable (formerly OtherGroupRule).
+    assert_eq!(results.len(), 1);
+    assert!(matches!(
+        results[0],
+        crate::db::repo::TrafficEntryResult::Unavailable
+    ));
+
+    // Rollback: even rule 100's update must NOT have landed.
+    let rule100_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let user_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = ?")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule100_t.0, 0, "legitimate entry must be rolled back too");
+    assert_eq!(user_t.0, 0);
+}
+
+/// v0.4.9: a rule_id that does NOT exist must produce the SAME result as a
+/// foreign rule (Unavailable) — NOT be silently skipped. This closes the
+/// rule-id existence oracle: a node can no longer tell, from the response,
+/// whether an id is missing vs owned by another group. The whole batch is
+/// rolled back; the legitimate rule's traffic does NOT land.
+#[tokio::test]
+async fn traffic_batch_unknown_rule_is_unavailable_not_skipped() {
+    let db = repo().await;
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (50, 'gin', 'in', 'tok-50', ?)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES (100, 'r100', ?, 20000, 50, '127.0.0.1', 80)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // Batch with rule 99999 (does not exist) + rule 100 (legitimate).
+    // Pre-v0.4.9 the unknown one was skipped and rule 100 still applied.
+    // Now the unknown id is treated identically to a foreign id → whole
+    // batch rejected (Unavailable), rule 100 NOT applied.
+    let results = db
+        .apply_traffic_batch(
+            50,
+            &[
+                relay_shared::protocol::TrafficEntry {
+                    rule_id: 99999,
+                    upload: 1,
+                    download: 2,
+                },
+                relay_shared::protocol::TrafficEntry {
+                    rule_id: 100,
+                    upload: 10,
+                    download: 20,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(matches!(
+        results[0],
+        crate::db::repo::TrafficEntryResult::Unavailable
+    ));
+    let rule_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_t.0, 0, "batch rolled back → rule 100 must not apply");
+}
+
+/// v0.4.9 overflow: a single entry whose upload+download exceeds i64::MAX
+/// → Overflow, whole batch rolled back.
+#[tokio::test]
+async fn traffic_batch_single_entry_overflow_rejects_and_rolls_back() {
+    let db = repo().await;
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (50, 'gin', 'in', 'tok-50', ?)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES (100, 'r100', ?, 20000, 50, '127.0.0.1', 80)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // upload + download just over i64::MAX.
+    let half = (i64::MAX as u64) / 2 + 1;
+    let results = db
+        .apply_traffic_batch(
+            50,
+            &[relay_shared::protocol::TrafficEntry {
+                rule_id: 100,
+                upload: half,
+                download: half,
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        results[0],
+        crate::db::repo::TrafficEntryResult::Overflow
+    ));
+    let rule_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_t.0, 0, "overflow → no write");
+}
+
+/// v0.4.9 overflow: duplicate rule_ids in one batch, each legal alone but
+/// overflowing when summed → Overflow, rolled back.
+#[tokio::test]
+async fn traffic_batch_duplicate_rule_ids_cumulative_overflow() {
+    let db = repo().await;
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (50, 'gin', 'in', 'tok-50', ?)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES (100, 'r100', ?, 20000, 50, '127.0.0.1', 80)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // Two entries for the SAME rule 100, each upload near i64::MAX/2.
+    // Individually legal; their aggregated delta overflows.
+    let half = (i64::MAX as u64) / 2 + 1;
+    let results = db
+        .apply_traffic_batch(
+            50,
+            &[
+                relay_shared::protocol::TrafficEntry {
+                    rule_id: 100,
+                    upload: half,
+                    download: 0,
+                },
+                relay_shared::protocol::TrafficEntry {
+                    rule_id: 100,
+                    upload: half,
+                    download: 0,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        results[0],
+        crate::db::repo::TrafficEntryResult::Overflow
+    ));
+    let rule_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_t.0, 0);
+}
+
+/// v0.4.9 overflow: a user owns two rules; each delta is legal, but their
+/// cumulative effect on the USER's total overflows → Overflow, rolled back
+/// (neither rule lands).
+#[tokio::test]
+async fn traffic_batch_user_cumulative_overflow_across_rules() {
+    let db = repo().await;
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (50, 'gin', 'in', 'tok-50', ?)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // Two rules under the same user/group (distinct listen_ports — the
+    // schema enforces listen_port uniqueness).
+    for (rid, port) in [(100, 20000), (101, 20001)] {
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+             VALUES (?, 'r', ?, ?, 50, '127.0.0.1', 80)",
+        )
+        .bind(rid)
+        .bind(alice)
+        .bind(port)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    // Pre-set the user's traffic near the ceiling so two legal deltas tip
+    // the USER total over i64::MAX (the per-rule totals would be fine).
+    sqlx::query("UPDATE users SET traffic_used = ? WHERE id = ?")
+        .bind(i64::MAX - 100)
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let results = db
+        .apply_traffic_batch(
+            50,
+            &[
+                relay_shared::protocol::TrafficEntry {
+                    rule_id: 100,
+                    upload: 60,
+                    download: 0,
+                },
+                relay_shared::protocol::TrafficEntry {
+                    rule_id: 101,
+                    upload: 60,
+                    download: 0,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        results[0],
+        crate::db::repo::TrafficEntryResult::Overflow
+    ));
+    // Neither rule nor the user changed.
+    let r100: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let r101: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = 101")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let user_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = ?")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(r100.0, 0);
+    assert_eq!(r101.0, 0);
+    assert_eq!(user_t.0, i64::MAX - 100, "user total unchanged");
+}
+
+/// v0.4.9: boundary — a delta that lands the rule's total EXACTLY on
+/// i64::MAX is accepted (overflow is strictly > MAX).
+#[tokio::test]
+async fn traffic_batch_exactly_i64_max_is_accepted() {
+    let db = repo().await;
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (50, 'gin', 'in', 'tok-50', ?)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES (100, 'r100', ?, 20000, 50, '127.0.0.1', 80)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // Pre-set rule + user to MAX-50, then add exactly 50 → lands on MAX.
+    sqlx::query("UPDATE forward_rules SET traffic_used = ? WHERE id = 100")
+        .bind(i64::MAX - 50)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET traffic_used = ? WHERE id = ?")
+        .bind(i64::MAX - 50)
+        .bind(alice)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let results = db
+        .apply_traffic_batch(
+            50,
+            &[relay_shared::protocol::TrafficEntry {
+                rule_id: 100,
+                upload: 50,
+                download: 0,
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        results[0],
+        crate::db::repo::TrafficEntryResult::Ok
+    ));
+    let rule_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_t.0, i64::MAX);
+}
+
+/// v0.4.9: duplicate rule_ids in an otherwise-legal batch are AGGREGATED
+/// (summed) and applied as ONE update — no double SQL, correct total.
+#[tokio::test]
+async fn traffic_batch_duplicate_rule_ids_are_aggregated() {
+    let db = repo().await;
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (50, 'gin', 'in', 'tok-50', ?)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES (100, 'r100', ?, 20000, 50, '127.0.0.1', 80)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // Three entries for rule 100 → aggregated to upload 6, download 60.
+    let results = db
+        .apply_traffic_batch(
+            50,
+            &[
+                relay_shared::protocol::TrafficEntry {
+                    rule_id: 100,
+                    upload: 1,
+                    download: 10,
+                },
+                relay_shared::protocol::TrafficEntry {
+                    rule_id: 100,
+                    upload: 2,
+                    download: 20,
+                },
+                relay_shared::protocol::TrafficEntry {
+                    rule_id: 100,
+                    upload: 3,
+                    download: 30,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        results[0],
+        crate::db::repo::TrafficEntryResult::Ok
+    ));
+    let rule_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let user_t: (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id = ?")
+        .bind(alice)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule_t.0, 66, "aggregated delta = 6+60");
+    assert_eq!(user_t.0, 66);
+}
+
+// ── KvsRepository ──
+
+#[tokio::test]
+async fn kvs_set_get_delete_round_trip() {
+    let db = repo().await;
+    // Absent key → None.
+    assert!(db.get("missing").await.unwrap().is_none());
+
+    // Set then get.
+    db.set("k", "v1").await.unwrap();
+    assert_eq!(db.get("k").await.unwrap().as_deref(), Some("v1"));
+
+    // Set again (INSERT OR REPLACE upsert).
+    db.set("k", "v2").await.unwrap();
+    assert_eq!(db.get("k").await.unwrap().as_deref(), Some("v2"));
+
+    // Delete returns rows affected.
+    assert_eq!(db.delete("k").await.unwrap(), 1);
+    assert!(db.get("k").await.unwrap().is_none());
+
+    // Delete of absent key returns 0.
+    assert_eq!(db.delete("k").await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn kvs_scan_prefix_returns_only_matching_keys() {
+    let db = repo().await;
+    db.set("node_status:1:a", "{}").await.unwrap();
+    db.set("node_status:1:b", "{}").await.unwrap();
+    db.set("node_status:2:c", "{}").await.unwrap();
+    db.set("other_feature:1", "{}").await.unwrap();
+
+    // scan_prefix matches the LIKE 'node_status:%' pattern.
+    let rows = db.scan_prefix("node_status:").await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|(k, _)| k.starts_with("node_status:")));
+
+    // A more specific prefix narrows further.
+    let rows = db.scan_prefix("node_status:1:").await.unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+// ── v0.4.10 fix PR: ProfileScope + ownership-invariant tests ──
+
+/// find_profile_by_id with BuiltinOnly must NOT return a custom profile.
+#[tokio::test]
+async fn find_profile_by_id_builtin_only_excludes_custom() {
+    let db = repo().await;
+    // Insert a custom (non-builtin) ws profile owned by admin (uid=1).
+    // v0.4.11 PR1: custom profiles must be ws/tls_simple to be "available".
+    sqlx::query(
+        "INSERT INTO tunnel_profiles (name, transport, tls_mode, ws_path, host_header, sni, is_builtin, uid) \
+         VALUES ('custom-x', 'ws', 'none', '/x', '', '', 0, 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let custom_id: i64 =
+        sqlx::query_scalar("SELECT id FROM tunnel_profiles WHERE name = 'custom-x'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+    // AvailableTemplates → Some (custom ws/tls_simple visible).
+    let r = TunnelProfileRepository::find_profile_by_id(
+        &db,
+        custom_id,
+        &ProfileScope::AvailableTemplates,
+    )
+    .await
+    .unwrap();
+    assert!(
+        r.is_some(),
+        "AvailableTemplates must return custom ws/tls_simple profile"
+    );
+
+    // All → Some.
+    let r = TunnelProfileRepository::find_profile_by_id(&db, custom_id, &ProfileScope::All)
+        .await
+        .unwrap();
+    assert!(r.is_some(), "All must return custom profile");
+}
+
+/// v0.4.11 PR3: Migration 24 NO LONGER pauses cross-owner rules.
+/// Shared inbound groups are now a valid use case (admin creates an inbound
+/// group, regular users attach rules to it). We verify the migration does
+/// NOT pause such rules.
+#[tokio::test]
+async fn migration_does_not_pause_cross_owner_shared_inbound_rules() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+    // user 2 (regular), group 20 owned by admin (user 1), rule owned by
+    // user 2 pointing at group 20 → shared inbound scenario, MUST NOT pause.
+    sqlx::query("INSERT INTO users (id, username, password, admin) VALUES (2, 'u2', 'x', 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (20, 'g', 'in', 't', 1)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO forward_rules (name, uid, listen_port, device_group_in, target_addr, target_port) \
+                 VALUES ('r', 2, 15000, 20, '127.0.0.1', 80)")
+        .execute(&pool).await.unwrap();
+
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&pool)
+        .await
+        .unwrap();
+    crate::db::schema::run_migrations(&pool).await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let paused: (i64,) = sqlx::query_as("SELECT paused FROM forward_rules WHERE name = 'r'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // v0.4.11 PR3: cross-owner shared inbound rules are ALLOWED
+    assert_eq!(
+        paused.0, 0,
+        "cross-owner shared inbound rule must NOT be paused"
+    );
+}
+
+/// Migration 24 pauses a regular user's rule bound to a non-builtin profile.
+#[tokio::test]
+async fn migration_pauses_non_admin_owner_custom_profile_rule() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO users (id, username, password, admin) VALUES (2, 'u2', 'x', 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (20, 'g', 'in', 't', 2)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO tunnel_profiles (name, transport, tls_mode, ws_path, host_header, sni, is_builtin, uid) \
+                 VALUES ('cust', 'direct', 'none', '/x', '', '', 0, 1)")
+        .execute(&pool).await.unwrap();
+    let pid: i64 = sqlx::query_scalar("SELECT id FROM tunnel_profiles WHERE name = 'cust'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO forward_rules (name, uid, listen_port, device_group_in, target_addr, target_port, tunnel_profile_id) \
+                 VALUES ('r', 2, 15001, 20, '127.0.0.1', 80, ?)")
+        .bind(pid)
+        .execute(&pool).await.unwrap();
+
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&pool)
+        .await
+        .unwrap();
+    crate::db::schema::run_migrations(&pool).await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let paused: (i64,) = sqlx::query_as("SELECT paused FROM forward_rules WHERE name = 'r'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        paused.0, 1,
+        "non-admin rule with custom profile must be paused"
+    );
+}
+
+/// Migration 24 must NOT pause a legitimate rule (owner-consistent groups,
+/// builtin-or-no profile). This is the false-positive guard.
+#[tokio::test]
+async fn migration_does_not_pause_valid_rules() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+    // Regular user 2, owns group 20, rule owned by 2 pointing at 20 → consistent.
+    sqlx::query("INSERT INTO users (id, username, password, admin) VALUES (2, 'u2', 'x', 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (20, 'g', 'in', 't', 2)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO forward_rules (name, uid, listen_port, device_group_in, target_addr, target_port) \
+                 VALUES ('r', 2, 15002, 20, '127.0.0.1', 80)")
+        .execute(&pool).await.unwrap();
+
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&pool)
+        .await
+        .unwrap();
+    crate::db::schema::run_migrations(&pool).await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let paused: (i64,) = sqlx::query_as("SELECT paused FROM forward_rules WHERE name = 'r'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(paused.0, 0, "valid rule must NOT be paused");
+}
+
+/// v0.4.11 PR3: list_active_for_config INCLUDES cross-owner rules (shared inbound).
+#[tokio::test]
+async fn list_active_for_config_excludes_cross_owner_rule() {
+    let db = repo().await;
+    // user 2 owns the rule; group 20 is owned by user 1 (admin, seeded).
+    // v0.4.11 PR3: this cross-owner rule IS returned by list_active_for_config
+    // (shared inbound group scenario). The invariant is now enforced at
+    // create_rule time via Migration 24, not filtered here.
+    sqlx::query("INSERT INTO users (id, username, password, admin) VALUES (2, 'u2', 'x', 0)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (20, 'g', 'in', 't', 1)")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO forward_rules (name, uid, listen_port, device_group_in, target_addr, target_port) \
+                 VALUES ('r', 2, 15003, 20, '127.0.0.1', 80)")
+        .execute(&db.pool).await.unwrap();
+
+    let rules = db.list_active_for_config(20).await.unwrap();
+    // v0.4.11 PR3: cross-owner rule is now included (shared inbound).
+    assert_eq!(
+        rules.len(),
+        1,
+        "shared inbound rule must be returned for config"
+    );
+}
+
+// ── v0.4.10 PR3: app_settings + insert_user_from_plan ──
+
+/// get_registration_settings returns None on a fresh DB (no row seeded).
+#[tokio::test]
+async fn settings_get_returns_none_when_unseeded() {
+    let db = repo().await;
+    let s = db.get_registration_settings().await.unwrap();
+    assert!(s.is_none(), "fresh DB must have no app_settings row");
+}
+
+/// insert_settings_if_absent inserts on first call, and is a no-op on the
+/// second call — the env-var seed value must NOT override an existing row.
+#[tokio::test]
+async fn settings_insert_if_absent_is_idempotent() {
+    let db = repo().await;
+    // First boot seed: enabled=true (simulating REGISTRATION_ENABLED=1).
+    db.insert_settings_if_absent(true, 1, &[1]).await.unwrap();
+    let s = db.get_registration_settings().await.unwrap().unwrap();
+    assert!(s.registration_enabled);
+    assert_eq!(s.default_registration_plan_id, 1);
+
+    // Simulate a restart with env still =1. The row already exists, so the
+    // insert_if_absent must NOT run — even though we pass true again. To
+    // prove the row isn't touched, first flip it to false (admin action),
+    // then call insert_if_absent(true) again and assert it stays false.
+    db.set_registration_settings(false, 1, &[1]).await.unwrap();
+    db.insert_settings_if_absent(true, 1, &[1]).await.unwrap(); // "restart"
+    let s = db.get_registration_settings().await.unwrap().unwrap();
+    assert!(
+        !s.registration_enabled,
+        "env-var seed must NOT re-enable registration after admin disabled it"
+    );
+}
+
+/// set_registration_settings is an upsert: it creates the row if missing
+/// (no need for a prior insert_settings_if_absent).
+#[tokio::test]
+async fn settings_set_upserts_when_no_row() {
+    let db = repo().await;
+    assert!(db.get_registration_settings().await.unwrap().is_none());
+    // PUT directly on an unseeded DB — upsert creates the row.
+    db.set_registration_settings(true, 1, &[1]).await.unwrap();
+    let s = db.get_registration_settings().await.unwrap().unwrap();
+    assert!(s.registration_enabled);
+}
+
+/// v0.4.21 PR2: allowed_plan_ids round-trips through set_registration_settings
+/// and insert_settings_if_absent (multi-plan, order preserved). Mirrors the PG
+/// test pg_settings_allowed_plan_ids_round_trip for two-backend parity.
+#[tokio::test]
+async fn settings_allowed_plan_ids_round_trip() {
+    let db = repo().await;
+    // Seed plan 2 for the multi-plan test.
+    sqlx::query(
+        "INSERT INTO plans (id, name, max_rules, traffic, speed_limit, ip_limit, price) \
+         VALUES (2, 'premium', 10, 0, 0, 5, '9.99') ON CONFLICT (id) DO NOTHING",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // Multi-plan settings round-trip.
+    db.set_registration_settings(true, 1, &[1, 2])
+        .await
+        .unwrap();
+    let s = db.get_registration_settings().await.unwrap().unwrap();
+    assert!(s.registration_enabled);
+    assert_eq!(s.default_registration_plan_id, 1);
+    assert_eq!(
+        s.allowed_plan_ids,
+        vec![1, 2],
+        "SQLite multi-plan round-trip"
+    );
+
+    // Unseeded row insert must also carry allowed_plan_ids.
+    sqlx::query("DELETE FROM app_settings WHERE id = 1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    db.insert_settings_if_absent(true, 2, &[2, 1])
+        .await
+        .unwrap();
+    let s2 = db.get_registration_settings().await.unwrap().unwrap();
+    assert!(s2.registration_enabled);
+    assert_eq!(s2.default_registration_plan_id, 2);
+    assert_eq!(
+        s2.allowed_plan_ids,
+        vec![2, 1],
+        "SQLite unseeded round-trip (order preserved)"
+    );
+}
+
+/// insert_user_from_plan atomically copies the plan's quota fields into the
+/// new user, and returns 0 when the plan doesn't exist (no user created).
+#[tokio::test]
+async fn insert_user_from_plan_inherits_quota_and_handles_missing_plan() {
+    let db = repo().await;
+    // plan_id=1 is the seeded 'free' plan (max_rules=5, traffic=107374182400).
+    let n = db.insert_user_from_plan("alice", "hash", 1).await.unwrap();
+    assert_eq!(n, 1, "user should be created for an existing plan");
+
+    let user = db.find_by_username("alice").await.unwrap().unwrap();
+    assert_eq!(user.plan_id, Some(1));
+    assert_eq!(user.max_rules, 5, "max_rules must be inherited from plan");
+    assert_eq!(
+        user.traffic_limit, 107374182400,
+        "traffic_limit must be inherited from plan.traffic"
+    );
+
+    // A non-existent plan → 0 rows affected, no user created.
+    let n = db.insert_user_from_plan("bob", "hash", 999).await.unwrap();
+    assert_eq!(n, 0, "missing plan must yield 0 rows affected");
+    assert!(
+        db.find_by_username("bob").await.unwrap().is_none(),
+        "no user should be created for a missing plan"
+    );
+}
+
+/// Migration 25 is idempotent: re-running run_migrations on a DB whose
+/// baseline SCHEMA_SQL already created app_settings must not error (the
+/// CREATE TABLE IF NOT EXISTS is a no-op). This pins the upgrade path for
+/// old databases that reach app_settings only via Migration 25.
+#[tokio::test]
+async fn migration_creates_app_settings_table() {
+    let db = repo().await;
+    // repo() ran SCHEMA_SQL (app_settings already present). Re-running
+    // migrations must succeed (Migration 25's IF NOT EXISTS is a no-op).
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    crate::db::schema::run_migrations(&db.pool)
+        .await
+        .expect("migrations must be idempotent on a baseline-schema DB");
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // The table exists and is queryable (repo() did not seed a row).
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM app_settings")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0, "table present but no row seeded by schema");
+}
+
+// ── v0.4.10 PR4: token_version + must_change_password ──
+
+/// find_auth_state_by_id returns (banned, token_version, must_change) in one
+/// query; None for a missing user.
+#[tokio::test]
+async fn find_auth_state_returns_all_three_or_none() {
+    let db = repo().await;
+    sqlx::query(
+        "INSERT INTO users (id, username, password, admin, banned, token_version, must_change_password) \
+         VALUES (2, 'u2', 'x', 0, 1, 7, 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let s = db.find_auth_state_by_id(2).await.unwrap().unwrap();
+    assert_eq!(s, (true, 7, true));
+    assert!(db.find_auth_state_by_id(999).await.unwrap().is_none());
+}
+
+/// change_own_password bumps token_version and clears must_change_password.
+#[tokio::test]
+async fn change_own_password_bumps_version_and_clears_must_change() {
+    let db = repo().await;
+    sqlx::query(
+        "INSERT INTO users (id, username, password, admin, token_version, must_change_password) \
+         VALUES (2, 'u2', 'old', 0, 3, 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let n = db.change_own_password(2, "newhash").await.unwrap();
+    assert_eq!(n, 1);
+    let s = db.find_auth_state_by_id(2).await.unwrap().unwrap();
+    assert_eq!(s.1, 4, "token_version must increment");
+    assert!(!s.2, "must_change_password must be cleared");
+    let pw = db.find_password_by_id(2).await.unwrap().unwrap();
+    assert_eq!(pw, "newhash");
+}
+
+/// admin_reset_password bumps token_version and sets must_change_password
+/// to the requested value.
+#[tokio::test]
+async fn admin_reset_password_bumps_version_and_sets_must_change() {
+    let db = repo().await;
+    sqlx::query(
+        "INSERT INTO users (id, username, password, admin, token_version, must_change_password) \
+         VALUES (2, 'u2', 'old', 0, 0, 0)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let n = db.admin_reset_password(2, "temphash", true).await.unwrap();
+    assert_eq!(n, 1);
+    let s = db.find_auth_state_by_id(2).await.unwrap().unwrap();
+    assert_eq!(s.1, 1, "token_version must increment");
+    assert!(s.2, "must_change_password must be set true");
+}
+
+/// Banning a user (update_user_fields banned=true) bumps token_version so
+/// the ban revokes their existing JWTs.
+#[tokio::test]
+async fn ban_bumps_token_version() {
+    let db = repo().await;
+    sqlx::query(
+        "INSERT INTO users (id, username, password, admin, banned, token_version) \
+         VALUES (2, 'u2', 'x', 0, 0, 5)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.update_user_fields(2, None, None, None, Some(true))
+        .await
+        .unwrap();
+    let s = db.find_auth_state_by_id(2).await.unwrap().unwrap();
+    assert!(s.0, "user must be banned");
+    assert_eq!(s.1, 6, "ban must bump token_version");
+}
+
+/// Unbanning (banned=false) does NOT bump token_version (only banning does).
+#[tokio::test]
+async fn unban_does_not_bump_token_version() {
+    let db = repo().await;
+    sqlx::query(
+        "INSERT INTO users (id, username, password, admin, banned, token_version) \
+         VALUES (2, 'u2', 'x', 0, 1, 5)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.update_user_fields(2, None, None, None, Some(false))
+        .await
+        .unwrap();
+    let s = db.find_auth_state_by_id(2).await.unwrap().unwrap();
+    assert!(!s.0, "user must be unbanned");
+    assert_eq!(s.1, 5, "unban must NOT bump token_version");
+}
+
+/// Migration 26 is idempotent on a baseline-schema DB (columns already
+/// present from SCHEMA_SQL).
+#[tokio::test]
+async fn migration_adds_password_columns() {
+    let db = repo().await;
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    crate::db::schema::run_migrations(&db.pool)
+        .await
+        .expect("migrations idempotent");
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // Both columns must be queryable.
+    let row: (i64, bool) =
+        sqlx::query_as("SELECT token_version, must_change_password FROM users WHERE id = 1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, 0, "default token_version is 0");
+    assert!(!row.1, "default must_change_password is false");
+}
+
+// ── v0.4.18 PR8: Owner-scope authorization tests ──
+//
+// These pin the contract that ResourceScope::Owner filters by uid.
+// The tested methods (delete_rule, find_rule_by_id, update_group_fields,
+// delete_group) all accept a scope parameter and must reject operations
+// on resources owned by a different user under Owner scope.
+
+/// Owner scope: delete_rule succeeds for own rule, fails for another user's rule.
+#[tokio::test]
+async fn delete_rule_owner_scope_rejects_wrong_owner() {
+    let db = repo().await;
+    // User 2 owns the rule, user 3 does not.
+    seed_user(&db, 2, false).await;
+    seed_user(&db, 3, false).await;
+    seed_group_typed(&db, 10, 2, "in").await;
+    db.insert_quota_guarded(
+        "r1",
+        2,
+        20000,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        10,
+        None,
+        "direct",
+        "127.0.0.1",
+        80,
+    )
+    .await
+    .unwrap();
+    let rule_id = db
+        .find_rule_by_id(1, &ResourceScope::All)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    // Owner can delete their own rule.
+    let n = db
+        .delete_rule(rule_id, &ResourceScope::Owner(2))
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "owner 2 must be able to delete their rule");
+
+    // Recreate the rule for the negative case.
+    seed_group_typed(&db, 11, 2, "in").await;
+    db.insert_quota_guarded(
+        "r2",
+        2,
+        20001,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        11,
+        None,
+        "direct",
+        "127.0.0.1",
+        81,
+    )
+    .await
+    .unwrap();
+    let rule_id2 = db
+        .find_rule_by_id(2, &ResourceScope::All)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    // User 3 must NOT be able to delete user 2's rule.
+    let n = db
+        .delete_rule(rule_id2, &ResourceScope::Owner(3))
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "user 3 must NOT delete user 2's rule");
+
+    // Rule must still exist (DELETE was rejected).
+    let still_there = db
+        .find_rule_by_id(rule_id2, &ResourceScope::All)
+        .await
+        .unwrap();
+    assert!(still_there.is_some(), "rule must survive rejected DELETE");
+}
+
+/// Owner scope: find_rule_by_id returns None for another user's rule.
+#[tokio::test]
+async fn find_rule_by_id_owner_scope_filters_other_owner() {
+    let db = repo().await;
+    seed_user(&db, 2, false).await;
+    seed_user(&db, 3, false).await;
+    seed_group_typed(&db, 10, 2, "in").await;
+    db.insert_quota_guarded(
+        "r1",
+        2,
+        20000,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        10,
+        None,
+        "direct",
+        "127.0.0.1",
+        80,
+    )
+    .await
+    .unwrap();
+    let rule_id = db
+        .find_rule_by_id(1, &ResourceScope::All)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    // Owner sees their rule.
+    let own = db
+        .find_rule_by_id(rule_id, &ResourceScope::Owner(2))
+        .await
+        .unwrap();
+    assert!(own.is_some(), "owner 2 must see own rule");
+
+    // Another user gets None (indistinguishable from "doesn't exist").
+    let other = db
+        .find_rule_by_id(rule_id, &ResourceScope::Owner(3))
+        .await
+        .unwrap();
+    assert!(other.is_none(), "user 3 must NOT see user 2's rule");
+}
+
+/// Owner scope: update_group_fields succeeds for own group, fails for another user's group.
+#[tokio::test]
+async fn update_group_fields_owner_scope_rejects_wrong_owner() {
+    let db = repo().await;
+    seed_user(&db, 2, false).await;
+    seed_user(&db, 3, false).await;
+    seed_group_typed(&db, 10, 2, "in").await;
+
+    // Owner can rename their group.
+    let n = db
+        .update_group_fields(
+            10,
+            &ResourceScope::Owner(2),
+            Some("renamed"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "owner 2 must be able to rename their group");
+
+    // User 3 must NOT be able to rename user 2's group.
+    let n = db
+        .update_group_fields(
+            10,
+            &ResourceScope::Owner(3),
+            Some("stolen"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "user 3 must NOT rename user 2's group");
+
+    // Verify name unchanged after rejected update.
+    let name = db
+        .find_name_by_id(10, &ResourceScope::All)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(name, "renamed", "name must survive rejected update");
+}
+
+/// Owner scope: delete_group succeeds for own group, fails for another user's group.
+#[tokio::test]
+async fn delete_group_owner_scope_rejects_wrong_owner() {
+    let db = repo().await;
+    seed_user(&db, 2, false).await;
+    seed_user(&db, 3, false).await;
+    seed_group_typed(&db, 10, 2, "in").await;
+
+    // User 3 must NOT be able to delete user 2's group.
+    let n = db.delete_group(10, &ResourceScope::Owner(3)).await.unwrap();
+    assert_eq!(n, 0, "user 3 must NOT delete user 2's group");
+
+    // Group must still exist.
+    let name = db.find_name_by_id(10, &ResourceScope::All).await.unwrap();
+    assert!(name.is_some(), "group must survive rejected DELETE");
+
+    // Owner CAN delete.
+    let n = db.delete_group(10, &ResourceScope::Owner(2)).await.unwrap();
+    assert_eq!(n, 1, "owner 2 must be able to delete their group");
+}
+
+// ── v0.4.18 PR8: SQLite parity gap fill — tests ported from pg_repo ──
+
+/// Cascade deletes rules, groups, profiles, and the user in one tx.
+/// Regression for v0.4.4: the cascade must delete custom tunnel_profiles.
+#[tokio::test]
+async fn delete_user_cascade_removes_rules_groups_profiles_and_user() {
+    let db = repo().await;
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let uid = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (1, 'gin', 'in', 'tok-1', ?)")
+        .bind(uid).execute(&db.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES ('r1', ?, 20000, 1, '127.0.0.1', 80)",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO tunnel_profiles (name, transport, uid) VALUES ('alice-custom', 'ws', ?)",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let affected = db.delete_user_cascade(uid).await.unwrap();
+    assert_eq!(affected, 1, "the user row must be deleted");
+
+    for (table, col) in [
+        ("forward_rules", "uid"),
+        ("device_groups", "uid"),
+        ("tunnel_profiles", "uid"),
+    ] {
+        let n: (i64,) =
+            sqlx::query_as(&format!("SELECT COUNT(*) FROM {} WHERE {} = ?", table, col))
+                .bind(uid)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(n.0, 0, "{} rows for user must be deleted", table);
+    }
+    assert!(!db.exists_by_id(uid).await.unwrap(), "user must be gone");
+}
+
+/// Switching a rule to "direct" clears device_group_out.
+/// Regression: SQLite tolerated duplicate column assignments; the fix ensures
+/// device_group_out is always set exactly once.
+#[tokio::test]
+async fn rule_update_switch_to_direct_clears_device_group_out() {
+    let db = repo().await;
+    seed_group(&db, 1).await;
+    seed_group_typed(&db, 2, 1, "out").await;
+    db.insert_quota_guarded(
+        "r1",
+        1,
+        20000,
+        "tcp",
+        "raw",
+        "raw",
+        "group",
+        "raw",
+        None,
+        1,
+        Some(2),
+        "group",
+        "127.0.0.1",
+        80,
+    )
+    .await
+    .unwrap();
+    let rule_id = db
+        .list_rules(&ResourceScope::All)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .id;
+
+    // Switch to direct: forward_mode="direct" + device_group_out=Some(None).
+    let affected = db
+        .update_rule_fields(
+            rule_id,
+            &ResourceScope::All,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(None),
+            Some("direct"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("update must succeed");
+    assert_eq!(affected, 1);
+
+    let dgo: (Option<i64>,) =
+        sqlx::query_as("SELECT device_group_out FROM forward_rules WHERE id = ?")
+            .bind(rule_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(dgo.0.is_none(), "device_group_out must be cleared to NULL");
+}
+
+/// v0.4.12: PG revision 7 migration SQL — cross-owner rules must be paused.
+/// Group owned by user 3, rule owned by user 2 → mismatch → paused.
+#[tokio::test]
+async fn migration_pauses_cross_owner_rules() {
+    let db = repo().await;
+    sqlx::query("INSERT INTO users (id, username, password, admin) VALUES (2, 'u2', 'x', 0)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO users (id, username, password, admin) VALUES (3, 'u3', 'x', 0)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (20, 'g', 'in', 't', 3)")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO forward_rules (name, uid, listen_port, device_group_in, target_addr, target_port) \
+                 VALUES ('r', 2, 15000, 20, '127.0.0.1', 80)")
+        .execute(&db.pool).await.unwrap();
+    // The exact UPDATE from PG revision 7 (cross-owner mismatch arm).
+    sqlx::query(
+        "UPDATE forward_rules SET paused = 1 \
+         WHERE paused = 0 \
+         AND EXISTS (SELECT 1 FROM device_groups dg \
+                     WHERE dg.id = forward_rules.device_group_in \
+                       AND dg.uid <> forward_rules.uid)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let paused: (i64,) = sqlx::query_as("SELECT paused FROM forward_rules WHERE name = 'r'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        paused.0, 1,
+        "cross-owner rule must be paused by migration SQL"
+    );
+}
+
+/// v0.4.12 PR1 (SQLite parity): combined shared_groups test — admin inbound
+/// is visible, out/monitor excluded, other regular users' groups excluded,
+/// admin caller gets empty list.
+#[tokio::test]
+async fn shared_groups_admin_inbound_only() {
+    let db = repo().await;
+    seed_user(&db, 2, false).await; // alice (regular)
+    seed_user(&db, 3, false).await; // bob (regular)
+    seed_group_typed(&db, 10, 1, "in").await;
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (11, 'g11', 'out', 'tok11', 1)")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (12, 'g12', 'monitor', 'tok12', 1)")
+        .execute(&db.pool).await.unwrap();
+    seed_group_typed(&db, 20, 3, "in").await; // bob's inbound
+
+    // alice (regular) sees ONLY admin inbound group 10.
+    let shared = db.list_shared_groups(2, false).await.unwrap();
+    assert_eq!(shared.len(), 1, "only admin 'in' group is shared");
+    assert_eq!(shared[0].id, 10);
+
+    // admin caller gets empty list.
+    let admin_shared = db.list_shared_groups(1, true).await.unwrap();
+    assert!(admin_shared.is_empty(), "admin gets no shared groups");
+}
+
+/// overflow entry without rollback check — minimal parity with PG's version.
+#[tokio::test]
+async fn traffic_batch_single_entry_overflow() {
+    let db = repo().await;
+    db.insert_user("alice", "h", 1).await.unwrap();
+    let alice = db.find_by_username("alice").await.unwrap().unwrap().id;
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (50, 'gin', 'in', 'tok-50', ?)")
+        .bind(alice).execute(&db.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES (100, 'r100', ?, 20000, 50, '127.0.0.1', 80)",
+    )
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let half = (i64::MAX as u64) / 2 + 1;
+    let results = db
+        .apply_traffic_batch(
+            50,
+            &[TrafficEntry {
+                rule_id: 100,
+                upload: half,
+                download: half,
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(results[0], TrafficEntryResult::Overflow));
+}

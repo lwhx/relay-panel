@@ -1,0 +1,118 @@
+# ============================================================================
+# RelayPanel deployment — pre-built images (no local build)
+#
+# Pulls images from GitHub Container Registry instead of building from source.
+# Use this for fast production deployments:
+#   docker compose -f docker-compose.release.yaml up -d
+#
+# By default ONLY the panel starts. The node container is opt-in via a
+# profile — most deployments run relay-node on a SEPARATE server via
+# scripts/relay-node-install.sh. To also run node on this host:
+#   docker compose -f docker-compose.release.yaml --profile node up -d
+# (or: RELAYPANEL_WITH_NODE=1 ./deploy.sh)
+#
+# To build from source instead, use docker-compose.yaml or:
+#   RELAYPANEL_BUILD_LOCAL=1 ./deploy.sh
+# ============================================================================
+
+services:
+  panel:
+    image: ghcr.io/moeshinx/relay-panel-panel:1.0.1
+    ports:
+      # RELAYPANEL_WEB_MODE controls how the panel port is published:
+      #   direct         → 0.0.0.0:18888:18888  (public, default)
+      #   reverse-proxy  → 127.0.0.1:18888:18888 (localhost only, external proxy)
+      #   caddy          → 127.0.0.1:18888:18888 (localhost only, Caddy handles TLS)
+      - "${RELAYPANEL_PANEL_PORT_BINDING:-0.0.0.0:18888}:18888"
+    environment:
+      # v0.4.3: DATABASE_URL is the canonical driver.  Supports SQLite and
+      # PostgreSQL.  Defaults to SQLite for one-click compatibility.
+      - DATABASE_URL=${DATABASE_URL:-sqlite:/app/data/data.db?mode=rwc}
+      - LISTEN=0.0.0.0:18888
+      - PUBLIC_DIR=/app/public
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set (see header comment in docker-compose.yaml)}
+      - PANEL_KEY=${PANEL_KEY:?PANEL_KEY must be set (see header comment in docker-compose.yaml)}
+      # OPTIONAL — the public URL nodes should use to reach the panel.
+      - PUBLIC_PANEL_URL=${PUBLIC_PANEL_URL:-}
+      # v0.4.19 — node-level GeoIP is now ON by default. The panel resolves
+      # each node's public IP to a country flag via built-in providers
+      # (primary ipinfo.io Lite → fallback ipwho.is). Failures degrade to
+      # "unknown" and never affect node status or forwarding. Results cache for
+      # GEOIP_CACHE_TTL seconds (default 7 days). To opt OUT set
+      # GEOIP_ENABLED=false in .env. See docs/DEPLOYMENT.md (privacy note).
+      - GEOIP_ENABLED=${GEOIP_ENABLED:-true}
+      - GEOIP_CACHE_TTL=${GEOIP_CACHE_TTL:-604800}
+    volumes:
+      - panel_data:/app/data
+    restart: unless-stopped
+
+  # The node container is OPTIONAL. Most deployments run relay-node on a
+  # separate forwarding server. To enable it on this host, use --profile node
+  # and set NODE_TOKEN to a real inbound-group token from the panel UI.
+  node:
+    image: ghcr.io/moeshinx/relay-panel-node:1.0.1
+    profiles:
+      - node
+    network_mode: host
+    environment:
+      - PANEL_URL=http://127.0.0.1:18888
+      # NODE_TOKEN has no default: the node refuses to start with an unset or
+      # "default-token" value. Set NODE_TOKEN to a real inbound-group token
+      # from the panel UI before enabling the node profile.
+      - NODE_TOKEN=${NODE_TOKEN:?NODE_TOKEN must be set to a real inbound-group token from the panel UI}
+      - POLL_INTERVAL=10
+    restart: unless-stopped
+    depends_on:
+      - panel
+
+  # Optional: Caddy reverse proxy for TLS + custom domain.
+  # Enable with --profile caddy and set RELAYPANEL_DOMAIN in .env.
+  # Caddy auto-issues a Let's Encrypt certificate on first start.
+  caddy:
+    image: caddy:2-alpine
+    profiles:
+      - caddy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      - RELAYPANEL_DOMAIN=${RELAYPANEL_DOMAIN:-}
+      - ACME_EMAIL=${ACME_EMAIL:-}
+      - CADDY_ACME_EMAIL_DIRECTIVE=${CADDY_ACME_EMAIL_DIRECTIVE:-}
+    restart: unless-stopped
+    depends_on:
+      - panel
+
+  # Optional: PostgreSQL backend (v0.4.3).  Only started when the postgres
+  # profile is enabled.  The panel reads DATABASE_URL to decide the backend.
+  # Usage:
+  #   docker compose -f docker-compose.release.yaml --profile postgres up -d
+  #   # or: RELAYPANEL_DB_MODE=embedded-postgres ./deploy.sh
+  postgres:
+    image: postgres:16-alpine
+    profiles:
+      - postgres
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-relaypanel}
+      - POSTGRES_USER=${POSTGRES_USER:-relaypanel}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-relaypanel} -d ${POSTGRES_DB:-relaypanel}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  panel_data:
+  postgres_data:
+  caddy_data:
+  caddy_config:

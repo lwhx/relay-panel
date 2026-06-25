@@ -1,0 +1,18 @@
+# Caddyfile for TLS termination with a custom domain.
+# Set RELAYPANEL_DOMAIN in .env (e.g. RELAYPANEL_DOMAIN=panel.example.com).
+# Caddy auto-issues a Let's Encrypt certificate on first start (ports 80/443
+# must be reachable from the internet).
+#
+# The domain is substituted from the environment at container start.
+# Caddy proxies to the panel service on the Compose network (panel:18888).
+
+{
+    {$CADDY_ACME_EMAIL_DIRECTIVE}
+}
+
+{$RELAYPANEL_DOMAIN} {
+    encode gzip zstd
+
+    # API + SPA served by the panel container on the Compose network
+    reverse_proxy panel:18888
+}

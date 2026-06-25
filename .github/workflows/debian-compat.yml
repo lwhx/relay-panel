@@ -1,0 +1,91 @@
+name: Debian Compat
+
+# Smoke-tests the Docker Compose deployment pipeline.
+#
+# Runs on ubuntu-latest using the runner's native Docker (NOT Docker-in-Docker
+# inside a Debian container — that had unreliable port mapping).
+#
+# Debian 11 / 12 / 13 are the target *host* platforms for real-machine
+# deployment. The Docker images are self-contained (bundled glibc), so a
+# single build + compose-up on ubuntu validates the deployment artifacts that
+# run identically on all three Debian versions.
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Docker Compose smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate secrets (.env)
+        run: |
+          cat > .env <<EOF
+          JWT_SECRET=$(openssl rand -hex 32)
+          PANEL_KEY=$(openssl rand -hex 16)
+          NODE_TOKEN=smoke-test-token
+          EOF
+
+      - name: docker compose build
+        run: docker compose build
+
+      - name: Verify binary is not the stub (strings check)
+        run: |
+          # The stub main.rs has fn main(){} and produces a tiny binary with no
+          # "RelayPanel" string. The real binary contains tracing output.
+          docker compose run --rm --no-deps panel sh -c \
+            'grep -c "RelayPanel" /app/relay-panel || (echo "STUB BINARY DETECTED — cargo clean -p did not work"; exit 1)'
+          echo "binary contains real panel code"
+
+      - name: docker compose up (panel)
+        run: docker compose up -d panel
+
+      - name: Wait for panel HTTP (port 18888)
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:18888/ >/dev/null 2>&1; then
+              echo "panel HTTP reachable"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "panel did not become reachable"
+          exit 1
+
+      - name: Verify login API
+        run: |
+          resp=$(curl -sf -X POST http://127.0.0.1:18888/api/v1/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"admin123"}')
+          echo "$resp" | grep -q '"code":0' && echo "login OK" || (echo "login FAILED: $resp" && exit 1)
+
+      # ---- Diagnostics (only run on failure) ----
+      - name: Diagnostics — docker compose ps
+        if: failure()
+        run: docker compose ps
+
+      - name: Diagnostics — docker ps -a
+        if: failure()
+        run: docker ps -a
+
+      - name: Diagnostics — panel logs (last 80 lines)
+        if: failure()
+        run: |
+          CID=$(docker compose ps -q panel)
+          echo "=== container id: $CID ==="
+          docker logs --tail 80 "$CID" 2>&1 || true
+          echo "=== inspect exit code ==="
+          docker inspect "$CID" --format='{{.State.Status}} exit={{.State.ExitCode}} err={{.State.Error}}' 2>&1 || true
+          echo "=== inspect env ==="
+          docker inspect "$CID" --format='{{range .Config.Env}}{{println .}}{{end}}' 2>&1 || true
+
+      - name: Diagnostics — panel port mapping
+        if: failure()
+        run: docker port relay-panel-panel-1 || true

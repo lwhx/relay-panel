@@ -1,0 +1,193 @@
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+use super::limiter::RateLimit;
+use super::selector::TargetSelector;
+use crate::reporter::{ConnectionTracker, TrafficCounter};
+
+pub async fn start_tcp_listener(
+    listen_addr: SocketAddr,
+    targets: Vec<String>,
+    selector: Arc<TargetSelector>,
+    rate_limit: RateLimit,
+    counter: Arc<TrafficCounter>,
+    connections: Arc<ConnectionTracker>,
+    rule_id: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = TcpListener::bind(listen_addr).await?;
+    tracing::info!("TCP listening on {} (rule {})", listen_addr, rule_id);
+
+    // v0.3.6: accept-loop resilience. A transient accept error (EMFILE,
+    // ENOMEM, temporary resource exhaustion) used to `?`-propagate and kill the
+    // whole listener task, leaving the port dead until node restart. Now we
+    // classify the error: transient -> back off and retry; the listener stays
+    // up. A non-transient error (e.g. the listener was closed) ends the task.
+    loop {
+        match listener.accept().await {
+            Ok((inbound, client_addr)) => {
+                let targets = targets.clone();
+                let selector = selector.clone();
+                let rate_limit = rate_limit.clone();
+                let counter = counter.clone();
+                let connections = connections.clone();
+
+                tokio::spawn(async move {
+                    // RAII guard: increments the active-TCP count on create,
+                    // decrements on drop (end of task — normal close, error, or
+                    // panic). Guarantees the count is correct even on abrupt close.
+                    let _guard = connections.tcp_handle();
+                    if let Err(e) = handle_tcp_connection(
+                        inbound,
+                        client_addr,
+                        targets,
+                        selector,
+                        rate_limit,
+                        counter,
+                        rule_id,
+                    )
+                    .await
+                    {
+                        tracing::debug!("TCP connection error: {}", e);
+                    }
+                });
+            }
+            Err(e) if is_transient_accept_error(&e) => {
+                // Back off briefly to avoid a hot error loop spamming logs, then
+                // continue accepting. 100ms is short enough that real clients
+                // don't notice but long enough to shed an error storm.
+                tracing::warn!(
+                    "TCP listener on {} (rule {}): transient accept error: {}; retrying in 100ms",
+                    listen_addr,
+                    rule_id,
+                    e
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                // Non-transient (e.g. listener closed, EBADF). End the task; the
+                // manager's is_finished recovery will restart it on next config
+                // if still desired.
+                return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+            }
+        }
+    }
+}
+
+/// Classify whether an `accept` error is worth retrying. Transient OS-level
+/// resource exhaustion (too many open files, out of memory) clears on its own;
+/// retrying is the right call. A bad-fd or closed-listener error is permanent.
+fn is_transient_accept_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e.kind(),
+        ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::ResourceBusy
+    ) || e.raw_os_error().is_some_and(|c| {
+        // EMFILE (24) / ENFILE (23) / ENOBUFS (105) / ENOMEM (12): transient
+        // resource exhaustion under load.
+        matches!(c, 24 | 23 | 105 | 12)
+    })
+}
+
+async fn handle_tcp_connection(
+    inbound: TcpStream,
+    client_addr: SocketAddr,
+    targets: Vec<String>,
+    selector: Arc<TargetSelector>,
+    rate_limit: RateLimit,
+    counter: Arc<TrafficCounter>,
+    rule_id: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // v0.4.6: pick targets per the rule's load-balancing strategy. The selector
+    // returns the ordered indices to attempt; we connect to the first reachable.
+    let mut outbound = None;
+    for idx in selector.order() {
+        let Some(target) = targets.get(idx) else {
+            continue;
+        };
+        match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(target)).await {
+            Ok(Ok(stream)) => {
+                selector.report(idx, true);
+                outbound = Some(stream);
+                break;
+            }
+            _ => {
+                selector.report(idx, false);
+                continue;
+            }
+        }
+    }
+
+    let outbound = match outbound {
+        Some(s) => s,
+        None => {
+            tracing::warn!("TCP: no target available for {}", client_addr);
+            return Err("no target available".into());
+        }
+    };
+
+    tracing::debug!("TCP: {} -> {}", client_addr, outbound.peer_addr()?);
+
+    // Bidirectional copy with traffic counting + per-rule rate limiting. We own
+    // both halves and pump both directions concurrently. When either side
+    // returns (the remote closed the connection) we shut down the matching write
+    // half so the other copy also sees EOF and returns.
+    //
+    // v0.4.6: each chunk is throttled through the shared RateLimit BEFORE being
+    // written, so the rule's aggregate cap holds across all connections. For
+    // unlimited rules the limiter is a no-op (one branch per chunk).
+    let (mut ri, mut wi) = inbound.into_split();
+    let (mut ro, mut wo) = outbound.into_split();
+
+    let counter_up = counter.clone();
+    let counter_down = counter.clone();
+    let rl_up = rate_limit.clone();
+    let rl_down = rate_limit;
+
+    let upload = Box::pin(async move {
+        let mut total = 0u64;
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = match ri.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            rl_up.acquire_upload(n as u64).await;
+            if wo.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+            total += n as u64;
+        }
+        counter_up.add(rule_id, total, 0).await;
+        let _ = wo.shutdown().await;
+    });
+    let download = Box::pin(async move {
+        let mut total = 0u64;
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = match ro.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            rl_down.acquire_download(n as u64).await;
+            if wi.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+            total += n as u64;
+        }
+        counter_down.add(rule_id, 0, total).await;
+        let _ = wi.shutdown().await;
+    });
+
+    let ((), ()) = tokio::join!(upload, download);
+
+    tracing::debug!("TCP: connection closed for {}", client_addr);
+    Ok(())
+}

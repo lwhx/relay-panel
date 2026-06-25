@@ -1,0 +1,185 @@
+/* RelayPanel global theme — clean, professional admin panel.
+   Inspired by NyanPass: white/light-gray bg, ample whitespace,
+   comfortable table rows, muted accents. No marketing glitz. */
+
+:root {
+  /* Layout */
+  --rp-sidebar-bg: #001529;
+  --rp-sidebar-width: 220px;
+  --rp-header-height: 56px;
+  --rp-content-padding: 24px;
+
+  /* Colors — muted, not garish */
+  --rp-bg: #f5f6f8;
+  --rp-card-bg: #ffffff;
+  --rp-border: #e8eaed;
+  --rp-text: #1f2329;
+  --rp-text-secondary: #646a73;
+  --rp-text-tertiary: #8f959e;
+
+  /* Accents */
+  --rp-primary: #1677ff;
+  --rp-primary-bg: #e8f3ff;
+  --rp-success: #00a878;
+  --rp-warning: #ed7b2f;
+  --rp-danger: #f54a45;
+
+  /* Tags — desaturated for admin comfort */
+  --rp-tag-tcp: #1677ff;
+  --rp-tag-udp: #722ed1;
+  --rp-tag-in: #389e0d;
+  --rp-tag-out: #08979c;
+  --rp-tag-admin: #d48806;
+
+  /* Radii & shadows — subtle */
+  --rp-radius: 6px;
+  --rp-radius-sm: 4px;
+  --rp-shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
+  --rp-shadow: 0 2px 8px rgba(0,0,0,0.06);
+
+  /* Table */
+  --rp-table-header-bg: #fafbfc;
+  --rp-table-row-hover: #f0f7ff;
+
+  /* Font */
+  --rp-font: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  --rp-font-mono: "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas,
+    "Courier New", monospace;
+}
+
+/* ---- Global resets ---- */
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--rp-bg);
+  font-family: var(--rp-font);
+  font-size: 14px;
+  color: var(--rp-text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ---- antd overrides ---- */
+
+/* Table: comfortable rows, subtle header */
+.ant-table {
+  font-size: 13px;
+}
+.ant-table-thead > tr > th {
+  background: var(--rp-table-header-bg) !important;
+  font-weight: 600;
+  color: var(--rp-text-secondary);
+  border-bottom: 1px solid var(--rp-border) !important;
+}
+.ant-table-tbody > tr > td {
+  border-bottom: 1px solid var(--rp-border) !important;
+}
+.ant-table-tbody > tr:hover > td {
+  background: var(--rp-table-row-hover) !important;
+}
+
+/* Cards: clean, minimal shadow */
+.ant-card {
+  border-radius: var(--rp-radius);
+  border: 1px solid var(--rp-border);
+  box-shadow: var(--rp-shadow-sm);
+}
+.ant-card-head {
+  min-height: 44px;
+  border-bottom: 1px solid var(--rp-border);
+}
+
+/* Buttons: uniform sizing, no wrapping */
+.ant-btn {
+  border-radius: var(--rp-radius-sm);
+  font-size: 13px;
+}
+
+/* Modal */
+.ant-modal-content {
+  border-radius: var(--rp-radius);
+}
+
+/* Form labels */
+.ant-form-item-label > label {
+  font-size: 13px;
+  color: var(--rp-text-secondary);
+}
+
+/* Segmented (language switch) */
+.ant-segmented {
+  border-radius: var(--rp-radius-sm);
+}
+
+/* Code/mono text for tokens, IPs, ports */
+.ant-typography code {
+  font-family: var(--rp-font-mono);
+  font-size: 12px;
+  background: var(--rp-table-header-bg);
+  border: 1px solid var(--rp-border);
+  border-radius: var(--rp-radius-sm);
+  padding: 1px 6px;
+}
+
+/* ---- Layout helpers ---- */
+.rp-page-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--rp-text);
+  margin: 0 0 16px 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rp-page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.rp-stat-card {
+  border-radius: var(--rp-radius);
+  border: 1px solid var(--rp-border);
+  box-shadow: var(--rp-shadow-sm);
+}
+.rp-stat-card .ant-statistic-title {
+  font-size: 13px;
+  color: var(--rp-text-secondary);
+}
+.rp-stat-card .ant-statistic-content {
+  font-size: 28px;
+  font-weight: 600;
+}
+
+/* Mono fields in tables */
+.rp-mono {
+  font-family: var(--rp-font-mono);
+  font-size: 12px;
+}
+
+/* v0.4.17: country-flag pill wrapper. Outer layer sizes & rounds the slot;
+ *  the inner .fi (from flag-icons) is pinned to a fixed flag size so the
+ *  library's own .fi rules never disturb the surrounding table layout. */
+.country-flag-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 40px;
+  height: 28px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: #eee7ff;
+  font-size: 12px;
+  color: var(--rp-text-secondary);
+  vertical-align: middle;
+}
+.country-flag-pill .fi {
+  width: 20px;
+  height: 14px;
+  border-radius: 2px;
+  background-size: cover;
+}

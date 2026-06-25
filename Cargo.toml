@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "crates/shared",
+    "crates/panel",
+    "crates/node",
+]
+resolver = "2"
+
+[workspace.package]
+license = "AGPL-3.0-only"
+edition = "2021"
+
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
